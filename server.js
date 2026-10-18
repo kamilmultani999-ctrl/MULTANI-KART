@@ -1,6 +1,7 @@
 const express = require("express");
 const path = require("path");
-const Database = require("better-sqlite3");
+const { Pool } = require("pg");
+const PgSession = require("connect-pg-simple")(session);
 const session = require("express-session");
 const crypto = require("crypto");
 
