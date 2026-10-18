@@ -24,13 +24,26 @@ CREATE TABLE IF NOT EXISTS products (
   price REAL NOT NULL, stock INTEGER NOT NULL DEFAULT 0, shop TEXT NOT NULL DEFAULT 'Local Store',
   active INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  phone TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT NOT NULL, phone TEXT NOT NULL,
   address TEXT NOT NULL, payment TEXT NOT NULL, payment_status TEXT NOT NULL DEFAULT 'Pending',
   total REAL NOT NULL, status TEXT NOT NULL DEFAULT 'New', items_json TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  customer_id INTEGER REFERENCES customers(id)
 );
 `);
+const orderColumns = db.prepare("PRAGMA table_info(orders)").all().map(c => c.name);
+if (!orderColumns.includes("customer_id")) {
+  db.exec("ALTER TABLE orders ADD COLUMN customer_id INTEGER REFERENCES customers(id)");
+}
 
 const count = db.prepare("SELECT COUNT(*) n FROM products").get().n;
 if (!count) {
@@ -158,6 +171,115 @@ app.post("/api/logout", (req, res) => req.session.destroy(() => {
 }));
 app.get("/api/me", (req, res) => res.json({ authenticated: req.session?.role === "admin", role: req.session?.role || null }));
 
+function normalizeCustomerPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  return digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;
+}
+function requireCustomer(req, res, next) {
+  if (req.session && req.session.role === "customer" && Number.isInteger(req.session.customerId)) return next();
+  return res.status(401).json({ error: "ઓર્ડર જોવા અથવા કરવા માટે પહેલાં Customer Login કરો." });
+}
+function hashCustomerPassword(password, salt) {
+  return crypto.scryptSync(String(password), salt, 64).toString("hex");
+}
+const customerLoginAttempts = new Map();
+function loginAttemptKey(req, phone) {
+  return `${req.ip || "unknown"}:${phone}`;
+}
+function tooManyCustomerAttempts(req, phone) {
+  const key = loginAttemptKey(req, phone);
+  const item = customerLoginAttempts.get(key);
+  if (!item) return false;
+  if (Date.now() - item.firstAt > 15 * 60 * 1000) {
+    customerLoginAttempts.delete(key);
+    return false;
+  }
+  return item.count >= 5;
+}
+function recordCustomerLoginFailure(req, phone) {
+  const key = loginAttemptKey(req, phone);
+  const item = customerLoginAttempts.get(key);
+  if (!item || Date.now() - item.firstAt > 15 * 60 * 1000) {
+    customerLoginAttempts.set(key, { count: 1, firstAt: Date.now() });
+  } else {
+    item.count += 1;
+  }
+}
+app.post("/api/customer/register", (req, res) => {
+  const name = String((req.body || {}).name || "").trim();
+  const phone = normalizeCustomerPhone((req.body || {}).phone);
+  const password = String((req.body || {}).password || "");
+  if (name.length < 2 || name.length > 80) return res.status(400).json({ error: "તમારું સાચું નામ દાખલ કરો." });
+  if (!/^[6-9]\d{9}$/.test(phone)) return res.status(400).json({ error: "ભારતીય 10 અંકનો મોબાઇલ નંબર દાખલ કરો." });
+  if (password.length < 8 || password.length > 128) return res.status(400).json({ error: "પાસવર્ડ ઓછામાં ઓછા 8 અક્ષરનો હોવો જોઈએ." });
+  if (db.prepare("SELECT id FROM customers WHERE phone=?").get(phone)) {
+    return res.status(409).json({ error: "આ મોબાઇલ નંબરનું એકાઉન્ટ પહેલેથી છે. Login કરો." });
+  }
+  const salt = crypto.randomBytes(16).toString("hex");
+  const passwordHash = hashCustomerPassword(password, salt);
+  let customerId;
+  try {
+    customerId = Number(db.prepare("INSERT INTO customers (name,phone,password_hash,password_salt) VALUES (?,?,?,?)")
+      .run(name, phone, passwordHash, salt).lastInsertRowid);
+  } catch (e) {
+    if (String(e.message).includes("UNIQUE")) return res.status(409).json({ error: "આ મોબાઇલ નંબરનું એકાઉન્ટ પહેલેથી છે. Login કરો." });
+    return res.status(500).json({ error: "એકાઉન્ટ બનાવી શકાયું નહીં. ફરી પ્રયાસ કરો." });
+  }
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({ error: "Login session બનાવી શકાયું નહીં." });
+    req.session.role = "customer";
+    req.session.customerId = customerId;
+    req.session.customerName = name;
+    req.session.customerPhone = phone;
+    req.session.save(err2 => {
+      if (err2) return res.status(500).json({ error: "એકાઉન્ટ session સાચવી શકાયું નહીં." });
+      res.status(201).json({ ok: true, customer: { id: customerId, name, phone } });
+    });
+  });
+});
+app.post("/api/customer/login", (req, res) => {
+  const phone = normalizeCustomerPhone((req.body || {}).phone);
+  const password = String((req.body || {}).password || "");
+  if (!/^[6-9]\d{9}$/.test(phone)) return res.status(400).json({ error: "યોગ્ય 10 અંકનો મોબાઇલ નંબર દાખલ કરો." });
+  if (tooManyCustomerAttempts(req, phone)) return res.status(429).json({ error: "ઘણા ખોટા પ્રયાસ થયા. 15 મિનિટ પછી ફરી પ્રયાસ કરો." });
+  const customer = db.prepare("SELECT id,name,phone,password_hash,password_salt FROM customers WHERE phone=?").get(phone);
+  const submitted = hashCustomerPassword(password, customer ? customer.password_salt : "unknown-customer-salt");
+  const valid = !!customer && safeEqual(submitted, customer.password_hash);
+  if (!valid) {
+    recordCustomerLoginFailure(req, phone);
+    return res.status(401).json({ error: "મોબાઇલ નંબર અથવા પાસવર્ડ ખોટો છે." });
+  }
+  customerLoginAttempts.delete(loginAttemptKey(req, phone));
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({ error: "Login session બનાવી શકાયો નહીં." });
+    req.session.role = "customer";
+    req.session.customerId = customer.id;
+    req.session.customerName = customer.name;
+    req.session.customerPhone = customer.phone;
+    req.session.save(err2 => {
+      if (err2) return res.status(500).json({ error: "Login session સાચવી શકાયો નહીં." });
+      res.json({ ok: true, customer: { id: customer.id, name: customer.name, phone: customer.phone } });
+    });
+  });
+});
+app.post("/api/customer/logout", (req, res) => {
+  if (req.session?.role !== "customer") return res.status(401).json({ error: "Customer Login નથી." });
+  req.session.destroy(err => {
+    if (err) return res.status(500).json({ error: "Logout થઈ શક્યું નહીં." });
+    res.clearCookie("multani_kart_admin");
+    res.json({ ok: true });
+  });
+});
+app.get("/api/customer/me", requireCustomer, (req, res) => {
+  const c = db.prepare("SELECT id,name,phone,created_at FROM customers WHERE id=?").get(req.session.customerId);
+  if (!c) return res.status(401).json({ error: "Customer account મળ્યું નહીં. ફરી Login કરો." });
+  res.json({ authenticated: true, customer: c });
+});
+app.get("/api/customer/orders", requireCustomer, (req, res) => {
+  const rows = db.prepare("SELECT * FROM orders WHERE customer_id=? ORDER BY id DESC").all(req.session.customerId);
+  res.json(rows.map(o => ({ ...o, items: JSON.parse(o.items_json) })));
+});
+
 const safeStatuses = ["New","Accepted","Packed","Out for Delivery","Delivered","Cancelled"];
 app.get("/api/health", (req,res) => res.json({ok:true, app:"MULTANI KART", area:"Nandasan"}));
 app.get("/api/payment-config", (req,res) => res.json({
@@ -191,32 +313,40 @@ app.patch("/api/products/:id", requireAdmin, (req,res) => {
     .run(name,category,price,Math.floor(stock),String(b.shop ?? p.shop).trim(),active,p.id);
   res.json(db.prepare("SELECT * FROM products WHERE id=?").get(p.id));
 });
-app.post("/api/orders", (req,res) => {
-  const {customer,phone,address,payment,items} = req.body || {};
-  if (!customer || !phone || !address || !Array.isArray(items) || !items.length) return res.status(400).json({error:"Please provide customer, phone, address and cart items."});
-  if (!["COD","ONLINE"].includes(payment)) return res.status(400).json({error:"Invalid payment method"});
-  if (payment === "ONLINE" && !process.env.UPI_ID) return res.status(503).json({error:"Online UPI payment હજી સેટ નથી. હાલ Cash on Delivery પસંદ કરો."});
-  const normalized=[];
-  let total=0;
-  const updateStock=db.prepare("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?");
-  const getProduct=db.prepare("SELECT * FROM products WHERE id=? AND active=1");
-  const transaction=db.transaction(() => {
+app.post("/api/orders", requireCustomer, (req,res) => {
+  const { address, payment, items } = req.body || {};
+  const customerId = req.session.customerId;
+  const customer = db.prepare("SELECT id,name,phone FROM customers WHERE id=?").get(customerId);
+  if (!customer) return res.status(401).json({ error: "Customer Login ફરી કરો." });
+  if (!String(address || "").trim() || String(address).trim().length < 4 || String(address).length > 500 || !Array.isArray(items) || !items.length || items.length > 50) {
+    return res.status(400).json({ error: "ઘરનું સરનામું અને કાર્ટની વસ્તુઓ તપાસો." });
+  }
+  if (!["COD","ONLINE"].includes(payment)) return res.status(400).json({ error: "Invalid payment method" });
+  if (payment === "ONLINE" && !process.env.UPI_ID) return res.status(503).json({ error: "Online UPI payment હજી સેટ નથી. હાલ Cash on Delivery પસંદ કરો." });
+  const normalized = [];
+  let total = 0;
+  const updateStock = db.prepare("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?");
+  const getProduct = db.prepare("SELECT * FROM products WHERE id=? AND active=1");
+  const transaction = db.transaction(() => {
     for (const item of items) {
-      const p=getProduct.get(Number(item.id));
-      const qty=Math.floor(Number(item.qty));
-      if (!p || !Number.isFinite(qty) || qty<1 || p.stock<qty) throw new Error(`Stock unavailable for ${p ? p.name : "a product"}`);
-      updateStock.run(qty,p.id,qty);
-      normalized.push({id:p.id,name:p.name,price:p.price,qty,shop:p.shop});
-      total += p.price*qty;
+      const p = getProduct.get(Number(item.id));
+      const qty = Math.floor(Number(item.qty));
+      if (!p || !Number.isFinite(qty) || qty < 1 || qty > 99 || p.stock < qty) throw new Error(`Stock unavailable for ${p ? p.name : "a product"}`);
+      updateStock.run(qty, p.id, qty);
+      normalized.push({ id:p.id, name:p.name, price:p.price, qty, shop:p.shop });
+      total += p.price * qty;
     }
-    const info=db.prepare("INSERT INTO orders (customer,phone,address,payment,payment_status,total,items_json) VALUES (?,?,?,?,?,?,?)")
-      .run(String(customer).trim(),String(phone).trim(),String(address).trim(),payment,payment==="COD"?"Pay on delivery":"Awaiting UPI payment confirmation",total,JSON.stringify(normalized));
+    const info = db.prepare("INSERT INTO orders (customer,phone,address,payment,payment_status,total,items_json,customer_id) VALUES (?,?,?,?,?,?,?,?)")
+      .run(customer.name, customer.phone, String(address).trim(), payment, payment === "COD" ? "Pay on delivery" : "Awaiting UPI payment confirmation", total, JSON.stringify(normalized), customer.id);
     return info.lastInsertRowid;
   });
   try {
-    const id=transaction();
-    res.json(db.prepare("SELECT * FROM orders WHERE id=?").get(id));
-  } catch(e) { res.status(400).json({error:e.message}); }
+    const id = transaction();
+    const order = db.prepare("SELECT * FROM orders WHERE id=?").get(id);
+    res.status(201).json({ ...order, items: normalized });
+  } catch(e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 app.get("/api/orders", requireAdmin, (req,res) => {
   const rows=db.prepare("SELECT * FROM orders ORDER BY id DESC").all();
