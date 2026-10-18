@@ -1,11 +1,21 @@
 const express = require("express");
 const path = require("path");
 const Database = require("better-sqlite3");
+const session = require("express-session");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "100kb" }));
+app.use(session({
+  name: "multani_kart_admin",
+  secret: process.env.SESSION_SECRET || "development-only-change-this-before-live-" + crypto.randomBytes(16).toString("hex"),
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 4 * 60 * 60 * 1000 }
+}));
 const db = new Database("multani-kart.db");
-app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 db.exec(`
@@ -114,6 +124,40 @@ if (!count) {
   ].forEach(x => seed.run(...x));
 }
 
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.role === "admin") return next();
+  return res.status(401).json({ error: "Admin login જરૂરી છે. પહેલાં Admin Login કરો." });
+}
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body || {};
+  const expectedUser = process.env.ADMIN_USERNAME;
+  const expectedPassword = process.env.ADMIN_PASSWORD;
+  if (!expectedUser || !expectedPassword || !process.env.SESSION_SECRET) {
+    return res.status(503).json({ error: "Render માં ADMIN_USERNAME, ADMIN_PASSWORD અને SESSION_SECRET સેટ કરો." });
+  }
+  if (!safeEqual(username, expectedUser) || !safeEqual(password, expectedPassword)) {
+    return res.status(401).json({ error: "Username અથવા Password ખોટો છે." });
+  }
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({ error: "Login session બનાવી શકાયો નહીં." });
+    req.session.role = "admin";
+    req.session.save(err2 => {
+      if (err2) return res.status(500).json({ error: "Login session સાચવી શકાયો નહીં." });
+      res.json({ ok: true, role: "admin" });
+    });
+  });
+});
+app.post("/api/logout", (req, res) => req.session.destroy(() => {
+  res.clearCookie("multani_kart_admin");
+  res.json({ ok: true });
+}));
+app.get("/api/me", (req, res) => res.json({ authenticated: req.session?.role === "admin", role: req.session?.role || null }));
+
 const safeStatuses = ["New","Accepted","Packed","Out for Delivery","Delivered","Cancelled"];
 app.get("/api/health", (req,res) => res.json({ok:true, app:"MULTANI KART", area:"Nandasan"}));
 app.get("/api/products", (req,res) => {
@@ -123,13 +167,13 @@ app.get("/api/products", (req,res) => {
     : db.prepare("SELECT * FROM products WHERE active=1 ORDER BY category,name").all();
   res.json(rows);
 });
-app.post("/api/products", (req,res) => {
+app.post("/api/products", requireAdmin, (req,res) => {
   const {name,category,price,stock,shop} = req.body || {};
   if (!name || !category || !Number.isFinite(Number(price)) || Number(price)<0) return res.status(400).json({error:"Name, category and valid price are required."});
   const info = db.prepare("INSERT INTO products (name,category,price,stock,shop) VALUES (?,?,?,?,?)").run(String(name),String(category),Number(price),Math.max(0,Number(stock)||0),String(shop||"Local Store"));
   res.json(db.prepare("SELECT * FROM products WHERE id=?").get(info.lastInsertRowid));
 });
-app.patch("/api/products/:id", (req,res) => {
+app.patch("/api/products/:id", requireAdmin, (req,res) => {
   const p = db.prepare("SELECT * FROM products WHERE id=?").get(req.params.id);
   if (!p) return res.status(404).json({error:"Product not found"});
   const b=req.body||{};
@@ -163,18 +207,18 @@ app.post("/api/orders", (req,res) => {
     res.json(db.prepare("SELECT * FROM orders WHERE id=?").get(id));
   } catch(e) { res.status(400).json({error:e.message}); }
 });
-app.get("/api/orders", (req,res) => {
+app.get("/api/orders", requireAdmin, (req,res) => {
   const rows=db.prepare("SELECT * FROM orders ORDER BY id DESC").all();
   res.json(rows.map(o=>({...o,items:JSON.parse(o.items_json)})));
 });
-app.patch("/api/orders/:id/status", (req,res) => {
+app.patch("/api/orders/:id/status", requireAdmin, (req,res) => {
   const status=String((req.body||{}).status||"");
   if (!safeStatuses.includes(status)) return res.status(400).json({error:"Invalid status"});
   const info=db.prepare("UPDATE orders SET status=? WHERE id=?").run(status,req.params.id);
   if (!info.changes) return res.status(404).json({error:"Order not found"});
   res.json(db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id));
 });
-app.get("/api/admin/summary", (req,res) => {
+app.get("/api/admin/summary", requireAdmin, (req,res) => {
   const orders=db.prepare("SELECT COUNT(*) n FROM orders").get().n;
   const revenue=db.prepare("SELECT COALESCE(SUM(total),0) n FROM orders WHERE status!='Cancelled'").get().n;
   const pending=db.prepare("SELECT COUNT(*) n FROM orders WHERE status NOT IN ('Delivered','Cancelled')").get().n;
