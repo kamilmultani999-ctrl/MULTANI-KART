@@ -15,7 +15,7 @@ app.use(session({
   saveUninitialized: false,
   cookie: { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 4 * 60 * 60 * 1000 }
 }));
-const db = new Database("multani-kart.db");
+const db = new Database(process.env.DB_PATH || path.join(__dirname, "multani-kart.db"));
 app.use(express.static(path.join(__dirname, "public")));
 
 db.exec(`
@@ -160,31 +160,42 @@ app.get("/api/me", (req, res) => res.json({ authenticated: req.session?.role ===
 
 const safeStatuses = ["New","Accepted","Packed","Out for Delivery","Delivered","Cancelled"];
 app.get("/api/health", (req,res) => res.json({ok:true, app:"MULTANI KART", area:"Nandasan"}));
+app.get("/api/payment-config", (req,res) => res.json({
+  upiId: process.env.UPI_ID || "",
+  payeeName: process.env.PAYMENT_NAME || "MULTANI KART",
+  whatsappNumber: String(process.env.ORDER_WHATSAPP_NUMBER || "").replace(/\D/g, "")
+}));
 app.get("/api/products", (req,res) => {
   const q = String(req.query.q || "").trim();
+  const showAll = req.query.all === "1" && req.session?.role === "admin";
+  const activeFilter = showAll ? "1=1" : "active=1";
   const rows = q
-    ? db.prepare("SELECT * FROM products WHERE active=1 AND (name LIKE ? OR category LIKE ? OR shop LIKE ?) ORDER BY category,name").all(`%${q}%`,`%${q}%`,`%${q}%`)
-    : db.prepare("SELECT * FROM products WHERE active=1 ORDER BY category,name").all();
+    ? db.prepare(`SELECT * FROM products WHERE ${activeFilter} AND (name LIKE ? OR category LIKE ? OR shop LIKE ?) ORDER BY category,name`).all(`%${q}%`,`%${q}%`,`%${q}%`)
+    : db.prepare(`SELECT * FROM products WHERE ${activeFilter} ORDER BY category,name`).all();
   res.json(rows);
 });
 app.post("/api/products", requireAdmin, (req,res) => {
   const {name,category,price,stock,shop} = req.body || {};
-  if (!name || !category || !Number.isFinite(Number(price)) || Number(price)<0) return res.status(400).json({error:"Name, category and valid price are required."});
-  const info = db.prepare("INSERT INTO products (name,category,price,stock,shop) VALUES (?,?,?,?,?)").run(String(name),String(category),Number(price),Math.max(0,Number(stock)||0),String(shop||"Local Store"));
+  if (!String(name||"").trim() || !String(category||"").trim() || !Number.isFinite(Number(price)) || Number(price)<0 || !Number.isFinite(Number(stock)) || Number(stock)<0) return res.status(400).json({error:"વસ્તુ, કેટેગરી, યોગ્ય ભાવ અને સ્ટોક દાખલ કરો."});
+  const info = db.prepare("INSERT INTO products (name,category,price,stock,shop) VALUES (?,?,?,?,?)").run(String(name).trim(),String(category).trim(),Number(price),Math.floor(Number(stock)),String(shop||"Local Store").trim());
   res.json(db.prepare("SELECT * FROM products WHERE id=?").get(info.lastInsertRowid));
 });
 app.patch("/api/products/:id", requireAdmin, (req,res) => {
   const p = db.prepare("SELECT * FROM products WHERE id=?").get(req.params.id);
   if (!p) return res.status(404).json({error:"Product not found"});
   const b=req.body||{};
+  const name=String(b.name ?? p.name).trim(), category=String(b.category ?? p.category).trim();
+  const price=Number(b.price ?? p.price), stock=Number(b.stock ?? p.stock), active=Number(b.active ?? p.active);
+  if (!name || !category || !Number.isFinite(price) || price<0 || !Number.isFinite(stock) || stock<0 || ![0,1].includes(active)) return res.status(400).json({error:"વસ્તુની વિગતો, ભાવ અને સ્ટોક તપાસો."});
   db.prepare("UPDATE products SET name=?,category=?,price=?,stock=?,shop=?,active=? WHERE id=?")
-    .run(b.name ?? p.name,b.category ?? p.category,Number(b.price ?? p.price),Math.max(0,Number(b.stock ?? p.stock)),b.shop ?? p.shop,Number(b.active ?? p.active),p.id);
+    .run(name,category,price,Math.floor(stock),String(b.shop ?? p.shop).trim(),active,p.id);
   res.json(db.prepare("SELECT * FROM products WHERE id=?").get(p.id));
 });
 app.post("/api/orders", (req,res) => {
   const {customer,phone,address,payment,items} = req.body || {};
   if (!customer || !phone || !address || !Array.isArray(items) || !items.length) return res.status(400).json({error:"Please provide customer, phone, address and cart items."});
   if (!["COD","ONLINE"].includes(payment)) return res.status(400).json({error:"Invalid payment method"});
+  if (payment === "ONLINE" && !process.env.UPI_ID) return res.status(503).json({error:"Online UPI payment હજી સેટ નથી. હાલ Cash on Delivery પસંદ કરો."});
   const normalized=[];
   let total=0;
   const updateStock=db.prepare("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?");
@@ -199,7 +210,7 @@ app.post("/api/orders", (req,res) => {
       total += p.price*qty;
     }
     const info=db.prepare("INSERT INTO orders (customer,phone,address,payment,payment_status,total,items_json) VALUES (?,?,?,?,?,?,?)")
-      .run(String(customer),String(phone),String(address),payment,payment==="COD"?"Pay on delivery":"Not paid — gateway not connected",total,JSON.stringify(normalized));
+      .run(String(customer).trim(),String(phone).trim(),String(address).trim(),payment,payment==="COD"?"Pay on delivery":"Awaiting UPI payment confirmation",total,JSON.stringify(normalized));
     return info.lastInsertRowid;
   });
   try {
@@ -215,6 +226,13 @@ app.patch("/api/orders/:id/status", requireAdmin, (req,res) => {
   const status=String((req.body||{}).status||"");
   if (!safeStatuses.includes(status)) return res.status(400).json({error:"Invalid status"});
   const info=db.prepare("UPDATE orders SET status=? WHERE id=?").run(status,req.params.id);
+  if (!info.changes) return res.status(404).json({error:"Order not found"});
+  res.json(db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id));
+});
+app.patch("/api/orders/:id/payment", requireAdmin, (req,res) => {
+  const paymentStatus=String((req.body||{}).payment_status||"");
+  if (!["Awaiting UPI payment confirmation","Paid","Failed","Pay on delivery"].includes(paymentStatus)) return res.status(400).json({error:"Invalid payment status"});
+  const info=db.prepare("UPDATE orders SET payment_status=? WHERE id=?").run(paymentStatus,req.params.id);
   if (!info.changes) return res.status(404).json({error:"Order not found"});
   res.json(db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id));
 });
